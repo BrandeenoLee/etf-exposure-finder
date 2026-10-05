@@ -31,7 +31,7 @@ Using the 2021 squeeze window, the `Weights_GME` sheet shows each fund's GME wei
 
 *(Illustrative values from the test data. Run it yourself for real figures.)*
 
-The workbook also includes a ranked **Latest_Snapshot**, a monthly **Rollup** (fund count, total shares held by funds), the full **All_Holdings** table, and a **Derivatives** sheet.
+The workbook also includes **Peak_Weights** (each fund's highest weight in the window and when), a ranked **Latest_Snapshot**, a monthly **Rollup** (fund count, total shares held by funds), the full **All_Holdings** table, and a **Derivatives** sheet.
 
 ## Quick start
 
@@ -64,6 +64,7 @@ The SEC requires a contact email in the User-Agent for automated downloads; it i
 | `--no-derivatives` | Skip swaps/options |
 | `--delete-zips` | Delete each zip after use to save disk |
 | `--offline` | Use only already-downloaded data |
+| `--overrides file.csv` | Fill fund tickers the SEC list is missing (defaults to `fund_ticker_overrides.csv`) |
 
 ## Tests
 
@@ -71,7 +72,7 @@ The SEC requires a contact email in the User-Agent for automated downloads; it i
 python -m pytest
 ```
 
-The tests build small synthetic N-PORT files that mirror the SEC's real format and cover the tricky cases: holdings with no ticker tag, filer formatting quirks (`"GME US"`), amended filings, swaps vs. shares, and the ETF filter. They run automatically on every push via GitHub Actions.
+The tests build small synthetic N-PORT files that mirror the SEC's real format and cover the tricky cases: holdings with no ticker tag, filer formatting quirks (`"GME US"`), amended filings, swaps vs. shares, the ETF filter, peak-weight tracking, size-first ranking, and ticker overrides. They run automatically on every push via GitHub Actions.
 
 ## Design notes
 
@@ -82,6 +83,7 @@ The tests build small synthetic N-PORT files that mirror the SEC's real format a
 ## Limitations
 
 - N-PORT data lags reality by roughly 3–6 months.
+- It's a series of month-end snapshots, and historically only each fund's fiscal-quarter-end months are public. Intra-month spikes, like XRT's ~20% GME weight on 27 Jan 2021, fall between reports. The `REPORT_MONTHS` column shows exactly which months each fund reported.
 - The ETF flag is a name-based heuristic; Vanguard ETFs (share classes of index mutual funds) aren't flagged.
 - Holding a stock doesn't mean a fund is being used to short it. This identifies candidates; testing the theory requires each ETF's short interest, failures-to-deliver, and creation/redemption activity, which is the planned next stage.
 

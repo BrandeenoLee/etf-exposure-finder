@@ -330,7 +330,27 @@ def dedupe_latest(df):
     return out.drop(columns=["FILING_DATE_D"])
 
 
-def tidy(direct, fund_tickers, min_aum):
+def load_overrides(path):
+    """
+    Optional CSV with columns MATCH,TICKER. MATCH is either an SEC series id
+    (e.g. S000012345) or a fund name (case-insensitive exact match).
+    Fills tickers the SEC's fund ticker list is missing.
+    """
+    if not path or not Path(path).exists():
+        return {}
+    df = pd.read_csv(path, dtype=str, comment="#").dropna()
+    return {m.strip().upper(): t.strip().upper() for m, t in zip(df["MATCH"], df["TICKER"])}
+
+
+def apply_overrides(names, series_ids, current, overrides):
+    if not overrides:
+        return current
+    by_id = series_ids.fillna("").str.upper().map(overrides)
+    by_name = names.fillna("").str.strip().str.upper().map(overrides)
+    return by_id.fillna(by_name).fillna(current)
+
+
+def tidy(direct, fund_tickers, min_aum, overrides=None):
     if direct.empty:
         return direct
     d = direct.copy()
@@ -362,6 +382,7 @@ def tidy(direct, fund_tickers, min_aum):
                 ACCESSION_NUMBER=("ACCESSION_NUMBER", "first"))
            .reset_index())
     g["FUND_TICKERS"] = g["SERIES_ID"].map(fund_tickers).fillna("")
+    g["FUND_TICKERS"] = apply_overrides(g["FUND_NAME"], g["SERIES_ID"], g["FUND_TICKERS"], overrides)
     g["LIKELY_ETF"] = g["FUND_NAME"].fillna("").str.contains(ETF_NAME_PATTERN) | \
                       g["REGISTRANT"].fillna("").str.contains(ETF_NAME_PATTERN)
     g["NET_FLOW_PCT_OF_ASSETS"] = 100 * g["NET_FLOW_3MO"] / g["FUND_NET_ASSETS"]
@@ -407,8 +428,40 @@ def latest_snapshot(g, top_n):
     # Drop funds whose latest report is stale (>9 months older than the newest)
     newest = pd.to_datetime(last.groupby("TICKER")["REPORT_DATE"].transform("max"))
     last = last[pd.to_datetime(last["REPORT_DATE"]) >= newest - pd.DateOffset(months=9)]
-    last = last.sort_values(["TICKER", "VEHICLE_SCORE"], ascending=[True, False])
+    months = report_months(g)
+    last = last.merge(months, on=["TICKER", "SERIES_ID"], how="left")
+    # Funds big enough to short in size first, then by score
+    last = last.sort_values(["TICKER", "SIZE_OK", "VEHICLE_SCORE"], ascending=[True, False, False])
     return last.groupby("TICKER").head(top_n)
+
+
+def report_months(g):
+    """Which months each fund actually has a public report for, e.g. '2020-12, 2021-03'."""
+    m = g.assign(M=pd.to_datetime(g["REPORT_DATE"]).dt.strftime("%Y-%m"))
+    return (m.groupby(["TICKER", "SERIES_ID"])["M"]
+             .agg(lambda x: ", ".join(sorted(set(x))))
+             .rename("REPORT_MONTHS").reset_index())
+
+
+def peak_view(g):
+    """Each fund's highest weight in the window and when it happened."""
+    if g.empty:
+        return g
+    g = g.sort_values("REPORT_DATE")
+    idx = g.groupby(["TICKER", "SERIES_ID"])["WEIGHT_PCT"].idxmax()
+    peak = g.loc[idx, ["TICKER", "SERIES_ID", "FUND_NAME", "FUND_TICKERS", "LIKELY_ETF",
+                       "WEIGHT_PCT", "REPORT_DATE", "FUND_NET_ASSETS", "SIZE_OK", "VALUE_USD"]]
+    peak = peak.rename(columns={"WEIGHT_PCT": "PEAK_WEIGHT_PCT", "REPORT_DATE": "PEAK_DATE",
+                                "FUND_NET_ASSETS": "NET_ASSETS_AT_PEAK", "SIZE_OK": "SIZE_OK_AT_PEAK",
+                                "VALUE_USD": "VALUE_USD_AT_PEAK"})
+    grp = g.groupby(["TICKER", "SERIES_ID"])
+    ends = pd.DataFrame({
+        "FIRST_DATE": grp["REPORT_DATE"].first(), "FIRST_WEIGHT_PCT": grp["WEIGHT_PCT"].first(),
+        "LAST_DATE": grp["REPORT_DATE"].last(), "LAST_WEIGHT_PCT": grp["WEIGHT_PCT"].last(),
+        "REPORTS": grp["REPORT_DATE"].nunique(),
+    }).reset_index()
+    out = peak.merge(ends, on=["TICKER", "SERIES_ID"]).merge(report_months(g), on=["TICKER", "SERIES_ID"])
+    return out.sort_values(["TICKER", "SIZE_OK_AT_PEAK", "PEAK_WEIGHT_PCT"], ascending=[True, False, False])
 
 
 def weight_pivot(g, top_funds=60):
@@ -457,7 +510,10 @@ Source: SEC Form N-PORT data sets (registered funds' reported portfolio holdings
 Each row is what a fund reported holding on its REPORT_DATE, not today.
 
 Sheets
-  Latest_Snapshot  Each fund's most recent report, ranked by VEHICLE_SCORE.
+  Latest_Snapshot  Each fund's most recent report. Funds passing SIZE_OK first, then by
+                   VEHICLE_SCORE.
+  Peak_Weights     Each fund's HIGHEST weight in the window and the date of that report.
+                   Funds passing SIZE_OK (at peak) first. Best view for historical runs.
   Rollup           One row per stock per month: fund count, total shares held by funds,
                    top fund by weight.
   Weights_<TICKER> Fund x month grid of the stock's weight in each fund (%). Funds that
@@ -475,6 +531,8 @@ Key columns
   SIZE_OK          Net assets at or above the --min-aum threshold.
   LIKELY_ETF       Name-based guess. Vanguard ETFs (share classes of index funds) and some
                    others will show False; check FUND_TICKERS.
+  REPORT_MONTHS    Months the fund has a public report for. Spikes between these months
+                   (e.g. XRT on 27 Jan 2021) are invisible in N-PORT.
   NET_FLOW_3MO     Shares sold minus redeemed (USD) over the 3 months in the filing. For ETFs
                    this reflects creations minus redemptions.
 
@@ -486,7 +544,7 @@ Caveats
 """
 
 
-def write_outputs(out_dir, tickers, g, rollup, snap, pivots, derivs, cusips, etf_only):
+def write_outputs(out_dir, tickers, g, rollup, snap, peaks, pivots, derivs, cusips, etf_only):
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = date.today().isoformat()
     base = f"{'_'.join(tickers)}_fund_exposure_{stamp}"
@@ -495,6 +553,7 @@ def write_outputs(out_dir, tickers, g, rollup, snap, pivots, derivs, cusips, etf
     if etf_only and not g.empty:
         g = g[g["LIKELY_ETF"]]
         snap = snap[snap["LIKELY_ETF"]] if not snap.empty else snap
+        peaks = peaks[peaks["LIKELY_ETF"]] if not peaks.empty else peaks
 
     g.to_csv(out_dir / f"{base}_all_holdings.csv", index=False)
     if not derivs.empty:
@@ -502,12 +561,14 @@ def write_outputs(out_dir, tickers, g, rollup, snap, pivots, derivs, cusips, etf
 
     snap_cols = ["TICKER", "REPORT_DATE", "FUND_NAME", "FUND_TICKERS", "LIKELY_ETF", "WEIGHT_PCT",
                  "FUND_NET_ASSETS", "SIZE_OK", "VEHICLE_SCORE", "SHARES_HELD", "VALUE_USD",
-                 "NET_FLOW_3MO", "NET_FLOW_PCT_OF_ASSETS", "HAS_SHORT_LINE", "REGISTRANT",
-                 "SERIES_ID"]
+                 "NET_FLOW_3MO", "NET_FLOW_PCT_OF_ASSETS", "HAS_SHORT_LINE", "REPORT_MONTHS",
+                 "REGISTRANT", "SERIES_ID"]
     with pd.ExcelWriter(xlsx, engine="openpyxl") as xw:
         pd.DataFrame({"README": README_TEXT.splitlines()}).to_excel(xw, sheet_name="README", index=False)
         if not snap.empty:
             snap[[c for c in snap_cols if c in snap]].to_excel(xw, sheet_name="Latest_Snapshot", index=False)
+        if not peaks.empty:
+            peaks.to_excel(xw, sheet_name="Peak_Weights", index=False)
         if not rollup.empty:
             rollup.to_excel(xw, sheet_name="Rollup", index=False)
         for tk, p in pivots.items():
@@ -548,6 +609,8 @@ def main(argv=None):
     p.add_argument("--no-derivatives", action="store_true", help="Skip derivative (options/swaps) matching")
     p.add_argument("--delete-zips", action="store_true", help="Delete each zip after processing to save disk")
     p.add_argument("--offline", action="store_true", help="Use only zips already in --data-dir")
+    p.add_argument("--overrides", type=Path, default=Path(__file__).with_name("fund_ticker_overrides.csv"),
+                   help="CSV of MATCH,TICKER to fill fund tickers the SEC list is missing")
     a = p.parse_args(argv)
 
     tickers = [t.upper() for t in a.tickers]
@@ -624,25 +687,40 @@ def main(argv=None):
     direct_all = dedupe_latest(pd.concat(directs, ignore_index=True)) if directs else pd.DataFrame()
     deriv_all = dedupe_latest(pd.concat(derivs, ignore_index=True)) if derivs else pd.DataFrame()
 
-    g = tidy(direct_all, fund_tickers, a.min_aum)
+    g = tidy(direct_all, fund_tickers, a.min_aum, load_overrides(a.overrides))
     rollup = period_rollup(g if not a.etf_only else g[g["LIKELY_ETF"]]) if not g.empty else pd.DataFrame()
     snap = latest_snapshot(g, a.top)
+    peaks = peak_view(g)
     pivots = weight_pivot(g if not a.etf_only else g[g["LIKELY_ETF"]]) if not g.empty else {}
     dv = tidy_derivs(deriv_all, fund_tickers)
 
-    xlsx = write_outputs(a.out, tickers, g, rollup, snap, pivots, dv, targets, a.etf_only)
+    xlsx = write_outputs(a.out, tickers, g, rollup, snap, peaks, pivots, dv, targets, a.etf_only)
     log(f"Done. Workbook: {xlsx.resolve()}")
 
-    # Console preview
-    if not snap.empty:
-        show = snap if not a.etf_only else snap[snap["LIKELY_ETF"]]
-        for tk, grp in show.groupby("TICKER"):
-            print(f"\nTop vehicle candidates for {tk} (latest reports):")
-            cols = ["REPORT_DATE", "FUND_TICKERS", "FUND_NAME", "WEIGHT_PCT", "FUND_NET_ASSETS"]
+    # Console preview: peaks for multi-period runs, latest snapshot otherwise
+    if not g.empty:
+        multi = pd.to_datetime(g["REPORT_DATE"]).dt.to_period("M").nunique() > 3
+        view = peaks if multi else snap
+        if a.etf_only:
+            view = view[view["LIKELY_ETF"]]
+        for tk, grp in view.groupby("TICKER"):
+            if multi:
+                print(f"\nPeak exposure for {tk} in this window "
+                      f"(size-qualified funds first, >= ${a.min_aum/1e6:,.0f}M):")
+                cols = ["PEAK_DATE", "FUND_TICKERS", "FUND_NAME", "PEAK_WEIGHT_PCT",
+                        "NET_ASSETS_AT_PEAK", "SIZE_OK_AT_PEAK"]
+                aum_col = "NET_ASSETS_AT_PEAK"
+            else:
+                print(f"\nTop vehicle candidates for {tk} "
+                      f"(size-qualified funds first, >= ${a.min_aum/1e6:,.0f}M):")
+                cols = ["REPORT_DATE", "FUND_TICKERS", "FUND_NAME", "WEIGHT_PCT",
+                        "FUND_NET_ASSETS", "SIZE_OK"]
+                aum_col = "FUND_NET_ASSETS"
             prev = grp[cols].head(15).copy()
-            prev["FUND_NET_ASSETS"] = (prev["FUND_NET_ASSETS"] / 1e6).round(1).astype(str) + "M"
-            prev["WEIGHT_PCT"] = prev["WEIGHT_PCT"].round(2)
+            prev[aum_col] = (prev[aum_col] / 1e6).round(1).astype(str) + "M"
+            prev[cols[3]] = prev[cols[3]].round(2)
             prev["FUND_NAME"] = prev["FUND_NAME"].str.slice(0, 45)
+            prev["FUND_TICKERS"] = prev["FUND_TICKERS"].str.slice(0, 20)
             print(prev.to_string(index=False))
     return 0
 

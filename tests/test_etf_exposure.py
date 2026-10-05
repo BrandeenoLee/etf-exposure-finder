@@ -59,3 +59,27 @@ def test_derivatives_separated(tmp_path):
 def test_etf_only_filter(tmp_path):
     snap = run(tmp_path, "--etf-only")["Latest_Snapshot"]
     assert set(snap["FUND_NAME"]) == {"SPDR S&P Retail ETF"}
+
+
+def test_peak_weights_and_report_months(tmp_path):
+    peaks = run(tmp_path)["Peak_Weights"]
+    xrt = peaks[peaks["FUND_NAME"] == "SPDR S&P Retail ETF"].iloc[0]
+    assert round(xrt["PEAK_WEIGHT_PCT"], 2) == 10.30
+    assert str(xrt["PEAK_DATE"]).startswith("2021-03-31")
+    assert xrt["FIRST_WEIGHT_PCT"] == 1.5
+    assert xrt["REPORT_MONTHS"] == "2020-12, 2021-03"
+
+
+def test_size_qualified_funds_rank_first(tmp_path):
+    # With a $1B threshold only Vanguard ($90B) qualifies, so it must rank first
+    snap = run(tmp_path, "--min-aum", "1e9")["Latest_Snapshot"]
+    assert snap.iloc[0]["FUND_NAME"] == "Vanguard Extended Market Index Fund"
+    assert bool(snap.iloc[0]["SIZE_OK"]) is True
+
+
+def test_ticker_overrides(tmp_path):
+    ov = tmp_path / "ov.csv"
+    ov.write_text("MATCH,TICKER\ngrowth opportunities fund,GROWX\nS000002,VXF\n")
+    snap = run(tmp_path, "--overrides", str(ov))["Latest_Snapshot"].set_index("FUND_NAME")
+    assert snap.loc["Growth Opportunities Fund", "FUND_TICKERS"] == "GROWX"
+    assert snap.loc["Vanguard Extended Market Index Fund", "FUND_TICKERS"] == "VXF"
